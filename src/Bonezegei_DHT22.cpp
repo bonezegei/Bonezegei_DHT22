@@ -7,17 +7,6 @@
 
 #include "Bonezegei_DHT22.h"
 
-static bool waitForPinState(int8_t pin, uint8_t state, uint16_t timeoutUs) {
-  uint16_t count = 0;
-  while (digitalRead(pin) != state) {
-    delayMicroseconds(1);
-    if (++count > timeoutUs) {
-      return false; // Timed out
-    }
-  }
-  return true;
-}
-
 Bonezegei_DHT22::Bonezegei_DHT22() {
   _pin = -1;
   _humidity = 0.0;
@@ -44,82 +33,79 @@ char Bonezegei_DHT22::begin() {
 }
 
 char Bonezegei_DHT22::getData() {
-  if (_pin < 0) {
-    return 0;
-  }
+  if (_pin < 0) return 0;
 
-  // Clear data array
-  for (int i = 0; i < 5; i++) {
-    data[i] = 0;
-  }
+  uint32_t cycles[80];
 
-  // Send start signal (Pull LOW for ~18ms, then HIGH for 30us)
+  // 1. Send start signal (Pull LOW for ~18ms, then HIGH for 30us)
   pinMode(_pin, OUTPUT);
   digitalWrite(_pin, LOW);
   delay(18);
 
-  noInterrupts();
   digitalWrite(_pin, HIGH);
   delayMicroseconds(30);
   pinMode(_pin, INPUT_PULLUP);
 
-  // Sensor response handshake (LOW ~80us, then HIGH ~80us)
-  if (!waitForPinState(_pin, LOW, 100)) {
-    interrupts();
-    return 0;
-  }
-  if (!waitForPinState(_pin, HIGH, 100)) {
-    interrupts();
-    return 0;
-  }
-  if (!waitForPinState(_pin, LOW, 100)) {
-    interrupts();
-    return 0;
+  // 2. Read pulse durations in a critical section
+  noInterrupts();
+
+  // Wait for sensor response LOW pulse (~80us)
+  uint32_t start = micros();
+  while (digitalRead(_pin) == LOW) {
+    if ((micros() - start) > 200) { interrupts(); return 0; }
   }
 
-  // Read 40 bits (5 bytes)
-  for (int i = 0; i < 40; i++) {
-    // Wait for pin to go HIGH (start of bit transmission)
-    if (!waitForPinState(_pin, HIGH, 100)) {
-      interrupts();
-      return 0;
+  // Wait for sensor response HIGH pulse (~80us)
+  start = micros();
+  while (digitalRead(_pin) == HIGH) {
+    if ((micros() - start) > 200) { interrupts(); return 0; }
+  }
+
+  // Sample 40 data bits (80 alternating LOW and HIGH state transitions)
+  for (int i = 0; i < 80; i += 2) {
+    // Measure LOW duration
+    start = micros();
+    while (digitalRead(_pin) == LOW) {
+      if ((micros() - start) > 200) { interrupts(); return 0; }
     }
+    cycles[i] = micros() - start;
 
-    // Sample bit state after 35 microseconds
-    delayMicroseconds(35);
-
-    uint8_t byteIdx = i / 8;
-    data[byteIdx] <<= 1;
-
-    // If pin is still HIGH at 35us, bit is '1', else '0'
-    if (digitalRead(_pin) == HIGH) {
-      data[byteIdx] |= 1;
+    // Measure HIGH duration
+    start = micros();
+    while (digitalRead(_pin) == HIGH) {
+      if ((micros() - start) > 200) { interrupts(); return 0; }
     }
-
-    // Wait for pin to go LOW (end of bit high pulse)
-    if (!waitForPinState(_pin, LOW, 100)) {
-      interrupts();
-      return 0;
-    }
+    cycles[i + 1] = micros() - start;
   }
 
   interrupts();
 
-  // Verify checksum
+  // 3. Decode pulse widths into bytes
+  data[0] = data[1] = data[2] = data[3] = data[4] = 0;
+
+  for (int i = 0; i < 40; i++) {
+    uint32_t lowCycles  = cycles[2 * i];
+    uint32_t highCycles = cycles[2 * i + 1];
+
+    data[i / 8] <<= 1;
+    // Standard DHT22 decoding: HIGH duration > LOW duration = Bit '1'
+    if (highCycles > lowCycles) {
+      data[i / 8] |= 1;
+    }
+  }
+
+  // 4. Verify Checksum
   uint8_t checksum = (data[0] + data[1] + data[2] + data[3]) & 0xFF;
   if (data[4] != checksum) {
     return 0;
   }
 
-  // Decode 16-bit Relative Humidity (scaled by 10)
+  // 5. Decode Humidity & Temperature
   uint16_t rawHumidity = ((uint16_t)data[0] << 8) | data[1];
   _humidity = rawHumidity / 10.0f;
 
-  // Decode 16-bit Temperature (scaled by 10)
   uint16_t rawTemp = (((uint16_t)(data[2] & 0x7F)) << 8) | data[3];
   _temperatureDeg = rawTemp / 10.0f;
-
-  // Handle negative temperature bit (MSB of byte 2)
   if (data[2] & 0x80) {
     _temperatureDeg = -_temperatureDeg;
   }
